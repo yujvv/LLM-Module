@@ -13,11 +13,17 @@ def use_rag_service_directly():
     # os.environ["OPENAI_API_KEY"] = "your-api-key"
     
     # 初始化服务
-    service = RAGService(
-        vector_db_path="./vector_db",     # 向量数据库路径
-        config_path="config.yaml",        # 配置文件路径
-        openai_model="gpt-3.5-turbo"      # 可选：指定OpenAI模型
-    )
+    try:
+        service = RAGService(
+            vector_db_path="./vector_db",     # 向量数据库路径
+            config_path="config.yaml",        # 配置文件路径
+            openai_model="gpt-3.5-turbo"      # 可选：指定OpenAI模型
+        )
+    except Exception as e:
+        print(f"初始化服务错误: {e}")
+        import traceback
+        traceback.print_exc()
+        return
     
     # 创建完成
     result = service.create_completion(
