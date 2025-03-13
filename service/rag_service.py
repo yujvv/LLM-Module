@@ -5,6 +5,7 @@ import yaml
 import openai
 import torch
 from typing import List, Dict, Any, Optional, Union, Tuple
+import traceback
 from llama_index.core import (
     StorageContext,
     Settings,
@@ -44,6 +45,13 @@ class RAGService:
             device: 计算设备(自动选择)
             top_k: 默认检索文档数量
         """
+        # 加载配置
+        self.config = self._load_config(config_path)
+        
+        # 设置默认参数
+        self.top_k = top_k
+        self.default_similarity_threshold = self.config.get("similarity_threshold", 0.7)
+        
         # 设置OpenAI
         self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
         if not self.openai_api_key:
@@ -52,17 +60,15 @@ class RAGService:
         self.openai_model = openai_model
         
         # 初始化OpenAI客户端
-        self.client = openai.OpenAI(
-            api_key=self.openai_api_key,
-            base_url=openai_base_url
-        )
-        
-        # 加载配置
-        self.config = self._load_config(config_path)
-        
-        # 设置默认参数
-        self.top_k = top_k
-        self.default_similarity_threshold = self.config.get("similarity_threshold", 0.7)
+        try:
+            self.client = openai.OpenAI(
+                api_key=self.openai_api_key,
+                base_url=openai_base_url
+            )
+        except Exception as e:
+            print(f"初始化OpenAI客户端错误: {e}")
+            traceback.print_exc()
+            raise
         
         # 初始化嵌入模型
         if device is None:
@@ -90,27 +96,28 @@ class RAGService:
         Returns:
             Dict[str, Any]: 配置参数
         """
+        # 默认配置
+        default_config = {
+            "system_prompt": "你是一个有用的AI助手。请基于提供的上下文回答问题。如果上下文中没有相关信息，请直接说明不知道。",
+            "similarity_threshold": 0.7,
+            "temperature": 0.7,
+            "max_tokens": 1024
+        }
+        
         try:
             if os.path.exists(config_path):
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = yaml.safe_load(f)
+                    if config is None:  # 文件存在但为空
+                        print(f"配置文件 {config_path} 为空，使用默认配置")
+                        return default_config
                     return config
             else:
                 print(f"配置文件 {config_path} 不存在，使用默认配置")
-                return {
-                    "system_prompt": "你是一个有用的AI助手。请基于提供的上下文回答问题。如果上下文中没有相关信息，请直接说明不知道。",
-                    "similarity_threshold": 0.7,
-                    "temperature": 0.7,
-                    "max_tokens": 1024
-                }
+                return default_config
         except Exception as e:
             print(f"加载配置文件错误: {e}, 使用默认配置")
-            return {
-                "system_prompt": "你是一个有用的AI助手。请基于提供的上下文回答问题。如果上下文中没有相关信息，请直接说明不知道。",
-                "similarity_threshold": 0.7,
-                "temperature": 0.7,
-                "max_tokens": 1024
-            }
+            return default_config
     
     def _load_vector_db(self, vector_db_path: str) -> None:
         """
@@ -132,6 +139,8 @@ class RAGService:
             print(f"成功加载向量数据库: {vector_db_path}")
             
         except Exception as e:
+            print(f"加载向量数据库错误: {e}")
+            traceback.print_exc()
             raise RuntimeError(f"加载向量数据库错误: {e}")
     
     def _retrieve_context(
