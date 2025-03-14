@@ -4,7 +4,8 @@ import json
 import yaml
 import openai
 import torch
-from typing import List, Dict, Any, Optional, Union, Tuple
+import asyncio
+from typing import List, Dict, Any, Optional, Union, Tuple, AsyncGenerator
 import traceback
 from llama_index.core import (
     StorageContext,
@@ -58,6 +59,7 @@ class RAGService:
             raise ValueError("请提供OpenAI API密钥或设置OPENAI_API_KEY环境变量")
             
         self.openai_model = openai_model
+        self.openai_base_url = openai_base_url
         
         # 初始化OpenAI客户端
         try:
@@ -101,7 +103,7 @@ class RAGService:
             "system_prompt": "你是一个有用的AI助手。请基于提供的上下文回答问题。如果上下文中没有相关信息，请直接说明不知道。",
             "similarity_threshold": 0.7,
             "temperature": 0.7,
-            "max_tokens": 1024
+            "max_tokens": 512
         }
         
         try:
@@ -268,7 +270,7 @@ class RAGService:
         actual_threshold = similarity_threshold if similarity_threshold is not None else self.default_similarity_threshold
         actual_top_k = top_k if top_k is not None else self.top_k
         actual_temperature = temperature if temperature is not None else self.config.get("temperature", 0.7)
-        actual_max_tokens = max_tokens if max_tokens is not None else self.config.get("max_tokens", 1024)
+        actual_max_tokens = max_tokens if max_tokens is not None else self.config.get("max_tokens", 512)
         
         # 检索相关上下文
         contexts, formatted_context = self._retrieve_context(
@@ -280,14 +282,22 @@ class RAGService:
         # 创建消息
         messages = self._create_messages(query, formatted_context)
         
-        # 调用OpenAI API
+        # 调用OpenAI API，使用新的参数
         response = self.client.chat.completions.create(
             model=self.openai_model,
             messages=messages,
             temperature=actual_temperature,
             max_tokens=actual_max_tokens,
-            stream=stream
+            stream=stream,
+            top_p=0.8,
+            extra_body={
+                "repetition_penalty": 1.05,
+            },
         )
+        
+        # 处理流式响应
+        if stream:
+            return {"stream": response, "contexts": contexts if return_context else None}
         
         # 构建返回结果
         result = {
@@ -306,6 +316,81 @@ class RAGService:
             result["formatted_context"] = formatted_context
         
         return result
+    
+    async def create_completion_stream(
+        self,
+        query: str,
+        client_id: str,
+        similarity_threshold: Optional[float] = None,
+        top_k: Optional[int] = None
+    ) -> AsyncGenerator[str, None]:
+        """
+        创建流式响应的异步生成器
+        
+        Args:
+            query: 用户查询
+            client_id: 客户端ID
+            similarity_threshold: 相似度阈值（可选）
+            top_k: 检索结果数量（可选）
+            
+        Yields:
+            str: 流式响应的文本块
+        """
+        # 使用提供的参数或默认值
+        actual_threshold = similarity_threshold if similarity_threshold is not None else self.default_similarity_threshold
+        actual_top_k = top_k if top_k is not None else self.top_k
+        temperature = self.config.get("temperature", 0.7)
+        max_tokens = self.config.get("max_tokens", 512)
+        
+        try:
+            # 检索相关上下文
+            contexts, formatted_context = self._retrieve_context(
+                query=query,
+                similarity_threshold=actual_threshold,
+                top_k=actual_top_k
+            )
+            
+            # 创建消息
+            messages = self._create_messages(query, formatted_context)
+            
+            # 调用OpenAI API（流式模式）
+            response = self.client.chat.completions.create(
+                model=self.openai_model,
+                messages=messages,
+                stream=True,
+                temperature=temperature,
+                top_p=0.8,
+                max_tokens=max_tokens,
+                extra_body={
+                    "repetition_penalty": 1.05,
+                },
+            )
+            
+            # 处理流式响应
+            collected_content = []
+            
+            for chunk in response:
+                if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        collected_content.append(content)
+                        yield content
+                elif hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'text'):
+                    # 处理不同的API响应格式
+                    content = chunk.choices[0].text
+                    if content:
+                        collected_content.append(content)
+                        yield content
+                        
+            # 如果没有内容返回，至少返回一个空字符串
+            if not collected_content:
+                yield "未能生成回复。"
+                
+        except Exception as e:
+            error_message = f"流式响应错误: {str(e)}"
+            print(error_message)
+            traceback.print_exc()
+            yield error_message
 
 
 # 使用示例
@@ -313,7 +398,8 @@ if __name__ == "__main__":
     # 初始化服务
     service = RAGService(
         vector_db_path="./vector_db",
-        openai_model="gpt-3.5-turbo"
+        openai_base_url="http://127.0.0.1:60002",
+        openai_model="rinna/qwen2.5-bakeneko-32b-instruct-gptq-int4"
     )
     
     # 创建完成
