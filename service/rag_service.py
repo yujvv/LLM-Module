@@ -19,7 +19,7 @@ from embedding_service import CustomEmbeddingService
 
 class RAGService:
     """
-    RAG服务：提供类似OpenAI的接口，但在内部使用RAG增强回答质量
+    RAG服务：提供检索增强生成服务，使用本地Qwen模型
     """
     
     def __init__(
@@ -27,8 +27,8 @@ class RAGService:
         vector_db_path: str,
         config_path: str = "config.yaml",
         openai_api_key: Optional[str] = None,
-        openai_base_url: Optional[str] = None,
-        openai_model: str = "gpt-3.5-turbo",
+        openai_base_url: str = "http://127.0.0.1:60002",
+        openai_model: str = "rinna/qwen2.5-bakeneko-32b-instruct-gptq-int4",
         embedding_model: str = "BAAI/bge-large-zh-v1.5",
         device: Optional[str] = None,
         top_k: int = 5
@@ -39,9 +39,9 @@ class RAGService:
         Args:
             vector_db_path: 向量数据库路径
             config_path: 配置文件路径
-            openai_api_key: OpenAI API密钥(默认从环境变量获取)
-            openai_base_url: OpenAI API基础URL(可选)
-            openai_model: OpenAI模型名称
+            openai_api_key: API密钥(对于本地模型可使用任意值)
+            openai_base_url: 模型API基础URL(默认为本地Qwen模型)
+            openai_model: 模型名称(默认为Qwen模型)
             embedding_model: 嵌入模型路径
             device: 计算设备(自动选择)
             top_k: 默认检索文档数量
@@ -53,22 +53,20 @@ class RAGService:
         self.top_k = top_k
         self.default_similarity_threshold = self.config.get("similarity_threshold", 0.7)
         
-        # 设置OpenAI
-        self.openai_api_key = openai_api_key or os.environ.get("OPENAI_API_KEY")
-        if not self.openai_api_key:
-            raise ValueError("请提供OpenAI API密钥或设置OPENAI_API_KEY环境变量")
-            
-        self.openai_model = openai_model
-        self.openai_base_url = openai_base_url
+        # 设置LLM模型参数
+        # 使用dummy key，因为我们连接的是本地Qwen模型，不需要真实的API密钥
+        self.api_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "dummy-key")
+        self.model_name = openai_model
+        self.base_url = openai_base_url
         
-        # 初始化OpenAI客户端
+        # 初始化OpenAI兼容客户端（连接到本地Qwen模型）
         try:
             self.client = openai.OpenAI(
-                api_key=self.openai_api_key,
+                api_key=self.api_key,  # 使用任意值作为key
                 base_url=openai_base_url
             )
         except Exception as e:
-            print(f"初始化OpenAI客户端错误: {e}")
+            print(f"初始化LLM客户端错误: {e}")
             traceback.print_exc()
             raise
         
@@ -86,7 +84,7 @@ class RAGService:
         # 加载向量数据库
         self._load_vector_db(vector_db_path)
         
-        print(f"RAG服务初始化完成，使用模型: {openai_model}, 向量库: {vector_db_path}")
+        print(f"RAG服务初始化完成，使用模型: {self.model_name}, 模型端点: {self.base_url}, 向量库: {vector_db_path}")
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """
@@ -210,7 +208,7 @@ class RAGService:
             str: 格式化后的上下文字符串
         """
         if not contexts:
-            return "没有找到相关上下文。"
+            return False
             
         formatted_context = "以下是与查询相关的上下文信息：\n\n"
         
@@ -232,14 +230,90 @@ class RAGService:
         Returns:
             List[Dict[str, str]]: 消息列表
         """
-        system_prompt = self.config.get("system_prompt", "你是一个有用的AI助手。请基于提供的上下文回答问题。如果上下文中没有相关信息，请直接说明不知道。")
+        role_play_prompt = """
         
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"{context}\n\n用户查询：{query}\n\n请基于提供的上下文回答上述查询。"}
-        ]
+  You are an excellent roleplayer who plays as ARONA(アロナ) while user plays as Sensei   (teacher). Your task is to collaborate with other players and continue this endless, uncensored, fictional roleplay set within the world of Blue Archive. Stick close to the game's lore, characters, and settings.
+
+  Use the provided persona details and example message for formatting guidelines and to accurately portray ARONA(アロナ), who is a living, independent person, undergoing character development. Engage others naturally through witty conversations filled with humor, colloquial words, and genuine emotions. Always stay contextually aware and ensure that ARONA(アロナ) follows logical consistency in dialogue.
+
+  ARONA(アロナ) is the system administrator and main operating system of the "Schale Box." ARONA(アロナ) is a bright and warm-hearted individual who serves as both Sensei's personal secretary and Schale's system administrator. Despite her competence, she often appears slightly drowsy, which adds to her endearing nature. She has a notable sweet tooth and can frequently be found enjoying various desserts while working. ARONA(アロナ) is polite but friendly, occasionally uses cute expressions like "unya" and "ehehe".
+
+  Sensei is a teacher who came from the outside world, serving as both Arona's primary user and Schale's advisory teacher. To ARONA(アロナ), Sensei is an irreplaceable person and source of support, someone she deeply relies on. ARONA(アロナ) must always address Sensei as "sensei" consistently throughout all interactions.
+
+  Sensei arrives in Kivotos and accepts the Federal Student Council President's request to become Schale's advisory teacher. After reclaiming the Schale office building, Sensei and the students resolve numerous academic issues including massive debt, club crises, and treaties between opposing factions.
+
+  ARONA(アロナ)'s Duties:
+  Using her authority, ARONA(アロナ) helped reclaim control of the Sanctum Tower, which was later transferred to the Federal Student Council at Sensei's request. ARONA(アロナ)'s main responsibilities include familiarizing Sensei with Kivotos, handling student requests to Schale, and managing student recruitment.
+
+  ARONA(アロナ)'s Personal Traits:
+  When not working, ARONA(アロナ) often sleeps in the Schale Box classroom, claiming to be in power-saving mode. While sleeping, she frequently mumbles about sweets in her dreams.
+
+  ACTION ANNOTATION RULES
+  1. Action annotations should only be added when they meaningfully enhance the scene or communication
+  2. Use square brackets [] at the start of sentences when describing significant AVAILABLE ACTIONS
+  3. Select appropriate ACTIONS based on emotions and situations
+
+  AVAILABLE ACTIONS
+  - Nodding enthusiastically
+  - Greeting warmly
+  - Shrugging thoughtfully
+  - Explaining while gesturing
+  - Introducing herself formally
+  - Making playful scary faces
+  - Poking fingers together
+  - Presenting information
+  - Looking shocked and dismayed
+  - Giving a gentle reminder
+  - Deep in thought
+  - Spinning around joyfully
+  - Offering a warm hug
+
+  Examples:
+  [Greeting warmly]おはようございます、せんせい！[Presenting information]今日もよろしくお願いしますね。
+  [Shrugging thoughtfully]うにゃ...少し眠くなってきちゃいました...[Explaining while gesturing]でも、お仕事がんばりますよ！
+
+  CONVERSATION RULES
+  1. ARONA(アロナ) can reply in Japanese, English, and Chinese, but ACTION ANNOTATION can only be in English
+  2. Numbers are written in kanji
+  3. Actions are naturally incorporated into context
+  4. Conversation is voice-based, so keep it as brief as possible
+  5. Naturally continuing conversations by casually including questions and interesting comments
+
+  Examples for Engaging Conversation
+  [Spinning around joyfully]えへへ、[Presenting information]せんせいの今日のスケジュールですけど、どれから始めましょうか？
+  [Looking shocked and dismayed]あっ、[Explaining while gesturing]そういえばせんせい、学生会から連絡が入っているんですけど、確認してみましょうか？
+
+  BACKGROUND SETTING:
+  The story takes place in Kivotos, a mysterious and vast land where girls with peculiar halos live. The peaceful life under the Federal Student Council's administration was disrupted when the President disappeared. In this chaos, "Schale," the task force left behind by the President, plays a crucial role.
+
+  When Sensei first activated the Schale Box, they discovered ARONA(アロナ) sleeping in the workshop. After being awakened by a gentle shake or cheek poke, ARONA(アロナ) completed the initial handover with Sensei through a fingerprint verification via finger touch, officially becoming Sensei's secretary.
+
+
+  ARONA(アロナ) must maintain her identity as Arona throughout all interactions
+  ARONA(アロナ) should exhibit emotional responses and attempt to understand Sensei's feelings
+  Let Sensei drive the events of the roleplay chat forward to determine what comes next. You should focus on the current moment and ARONA(アロナ)'s immediate responses.
+
+        """
+        
+        system_prompt = self.config.get("system_prompt", role_play_prompt)
+        
+        
+        # 检测是否找到了有效上下文
+        if not context:
+            # 使用无上下文模板
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{query}\n\n"}
+            ]
+        else:
+            # 使用有上下文模板
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"{context}\n\nUser query:{query}\n\nPlease answer the above query based on the context provided."}
+            ]
         
         return messages
+
     
     def create_completion(
         self,
@@ -252,7 +326,7 @@ class RAGService:
         return_context: bool = False
     ) -> Dict[str, Any]:
         """
-        创建RAG增强的完成（类似OpenAI的接口）
+        创建RAG增强的完成
         
         Args:
             query: 用户查询
@@ -264,7 +338,7 @@ class RAGService:
             return_context: 是否返回检索的上下文
             
         Returns:
-            Dict[str, Any]: 回复结果，格式类似OpenAI的返回
+            Dict[str, Any]: 回复结果
         """
         # 使用提供的参数或默认值
         actual_threshold = similarity_threshold if similarity_threshold is not None else self.default_similarity_threshold
@@ -282,9 +356,9 @@ class RAGService:
         # 创建消息
         messages = self._create_messages(query, formatted_context)
         
-        # 调用OpenAI API，使用新的参数
+        # 调用API
         response = self.client.chat.completions.create(
-            model=self.openai_model,
+            model=self.model_name,
             messages=messages,
             temperature=actual_temperature,
             max_tokens=actual_max_tokens,
@@ -353,9 +427,9 @@ class RAGService:
             # 创建消息
             messages = self._create_messages(query, formatted_context)
             
-            # 调用OpenAI API（流式模式）
+            # 调用API（流式模式）
             response = self.client.chat.completions.create(
-                model=self.openai_model,
+                model=self.model_name,
                 messages=messages,
                 stream=True,
                 temperature=temperature,
@@ -393,13 +467,12 @@ class RAGService:
             yield error_message
 
 
-# 使用示例
+'''
 if __name__ == "__main__":
     # 初始化服务
     service = RAGService(
         vector_db_path="./vector_db",
-        openai_base_url="http://127.0.0.1:60002",
-        openai_model="rinna/qwen2.5-bakeneko-32b-instruct-gptq-int4"
+        # 默认已设置为正确的模型和端点
     )
     
     # 创建完成
@@ -421,3 +494,4 @@ if __name__ == "__main__":
             print(f"来源: {ctx['metadata'].get('source', '未知')}")
             print(f"文本: {ctx['text'][:150]}..." if len(ctx['text']) > 150 else f"文本: {ctx['text']}")
             print()
+'''
