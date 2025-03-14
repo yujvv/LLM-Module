@@ -210,12 +210,12 @@ class RAGService:
         if not contexts:
             return False
             
-        formatted_context = "以下是与查询相关的上下文信息：\n\n"
+        formatted_context = "The following is contextual information related to the query:\n\n"
         
         for i, ctx in enumerate(contexts, 1):
-            source = ctx.get("metadata", {}).get("source", "未知来源")
+            source = ctx.get("metadata", {}).get("source", "Unknown source")
             text = ctx.get("text", "")
-            formatted_context += f"上下文 {i}（来源：{source}）：\n{text}\n\n"
+            formatted_context += f"Context {i}(Source:{source}):\n{text}\n\n"
             
         return formatted_context
     
