@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import os
 from typing import Optional, Dict, Any, List
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from rag_service import RAGService
 
@@ -10,27 +11,14 @@ from rag_service import RAGService
 
 class CompletionRequest(BaseModel):
     """完成请求模型"""
-    query: str = Field(..., description="用户查询文本")
-    similarity_threshold: Optional[float] = Field(None, description="相似度阈值，低于此值的结果将被过滤")
-    top_k: Optional[int] = Field(None, description="检索的最大结果数量")
-    temperature: Optional[float] = Field(None, description="温度参数，控制输出的随机性")
-    max_tokens: Optional[int] = Field(None, description="最大生成token数")
-    stream: bool = Field(False, description="是否流式返回")
-    return_context: bool = Field(False, description="是否返回检索的上下文")
-
-class CompletionResponse(BaseModel):
-    """完成响应模型"""
-    completion: str = Field(..., description="生成的回复")
-    model: str = Field(..., description="使用的模型")
-    usage: Dict[str, int] = Field(..., description="token使用情况")
-    contexts: Optional[List[Dict[str, Any]]] = Field(None, description="检索的上下文")
-    formatted_context: Optional[str] = Field(None, description="格式化后的上下文")
+    prompt: str = Field(..., description="用户查询文本")
+    id: str = Field(..., description="客户端ID")
 
 # ----- 创建应用 -----
 
 app = FastAPI(
     title="RAG API服务",
-    description="提供类似OpenAI的API接口，但在内部使用RAG增强回答质量",
+    description="提供RAG增强的流式响应API",
     version="1.0.0"
 )
 
@@ -55,10 +43,7 @@ def get_rag_service() -> RAGService:
         # 从环境变量获取配置
         vector_db_path = os.environ.get("VECTOR_DB_PATH", "./vector_db")
         config_path = os.environ.get("CONFIG_PATH", "config.yaml")
-        openai_api_key = os.environ.get("OPENAI_API_KEY")
-        openai_base_url = os.environ.get("OPENAI_BASE_URL")
-        openai_model = os.environ.get("OPENAI_MODEL", "gpt-3.5-turbo")
-        embedding_model = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-large-zh-v1.5")
+        openai_api_key = os.environ.get("OPENAI_API_KEY", "dummy-key")  # 使用虚拟密钥，因为我们将直接连接到本地模型
         
         # 初始化服务
         try:
@@ -66,40 +51,59 @@ def get_rag_service() -> RAGService:
                 vector_db_path=vector_db_path,
                 config_path=config_path,
                 openai_api_key=openai_api_key,
-                openai_base_url=openai_base_url,
-                openai_model=openai_model,
-                embedding_model=embedding_model
+                openai_base_url="http://127.0.0.1:60002",  # 直接连接到指定模型服务
+                openai_model="rinna/qwen2.5-bakeneko-32b-instruct-gptq-int4"  # 使用指定模型
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"服务初始化失败: {str(e)}")
     
     return rag_service
 
+# ----- 流式响应生成器 -----
+
+async def stream_response(client_id: str, query: str, service: RAGService):
+    """生成流式响应"""
+    try:
+        # 调用RAG服务的流式完成
+        async for chunk in service.create_completion_stream(
+            query=query,
+            client_id=client_id
+        ):
+            yield chunk.encode('utf-8') + b'\n'
+    except Exception as e:
+        yield f"错误: {str(e)}".encode('utf-8')
+
 # ----- API端点 -----
 
-@app.post("/v1/completions", response_model=CompletionResponse)
-async def create_completion(
+@app.post("/")
+async def root(
     request: CompletionRequest,
     service: RAGService = Depends(get_rag_service)
 ):
     """
-    创建RAG增强的完成
-    
-    返回结果类似于OpenAI的API响应，但内部使用RAG增强了回答质量
+    主要API端点，接收prompt和id，返回流式响应
     """
+    return StreamingResponse(
+        stream_response(request.id, request.prompt, service),
+        media_type="text/plain"
+    )
+
+# 保留旧的API端点以兼容性
+@app.post("/v1/completions")
+async def create_completion(
+    request: Request,
+    service: RAGService = Depends(get_rag_service)
+):
+    """旧版API端点，保留以兼容性"""
     try:
-        # 调用服务
-        result = service.create_completion(
-            query=request.query,
-            similarity_threshold=request.similarity_threshold,
-            top_k=request.top_k,
-            temperature=request.temperature,
-            max_tokens=request.max_tokens,
-            stream=request.stream,
-            return_context=request.return_context
-        )
+        data = await request.json()
+        query = data.get("query", "")
+        client_id = data.get("id", "default-client")
         
-        return result
+        return StreamingResponse(
+            stream_response(client_id, query, service),
+            media_type="text/plain"
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"处理请求时出错: {str(e)}")
 
@@ -113,3 +117,18 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    
+'''    
+url = "http://127.0.0.1:8000"
+data = {"prompt": prompt, "id": self.client_id}
+headers = {"Content-Type": "application/json"}
+response = requests.post(url, json=data, headers=headers, stream=True)
+
+if response.status_code == 200:
+    for line in response.iter_lines():
+        if line:
+            decoded_line = line.decode('utf-8')
+            yield decoded_line
+else:
+    print(f"请求失败，状态码：{response.status_code}")
+'''
