@@ -22,16 +22,18 @@ class RAGService:
     RAG服务：提供检索增强生成服务，使用本地Qwen模型
     """
     
+
     def __init__(
         self,
         vector_db_path: str,
         config_path: str = "config.yaml",
         openai_api_key: Optional[str] = None,
         openai_base_url: str = "http://127.0.0.1:60002",
-        openai_model: str = "rinna/qwen2.5-bakeneko-32b-instruct-gptq-int4",
-        embedding_model: str = "BAAI/bge-large-zh-v1.5",
+        openai_model: str = "default",
+        embedding_model: str = "BAAI/bge-m3",
         device: Optional[str] = None,
-        top_k: int = 5
+        top_k: int = 5,
+        require_vector_db: bool = True  # Add parameter to control whether vector DB is required
     ):
         """
         初始化RAG服务
@@ -41,7 +43,7 @@ class RAGService:
             config_path: 配置文件路径
             openai_api_key: API密钥(对于本地模型可使用任意值)
             openai_base_url: 模型API基础URL(默认为本地Qwen模型)
-            openai_model: 模型名称(默认为Qwen模型)
+            openai_model: 模型名称(默认为default)
             embedding_model: 嵌入模型路径
             device: 计算设备(自动选择)
             top_k: 默认检索文档数量
@@ -56,14 +58,20 @@ class RAGService:
         # 设置LLM模型参数
         # 使用dummy key，因为我们连接的是本地Qwen模型，不需要真实的API密钥
         self.api_key = openai_api_key or os.environ.get("OPENAI_API_KEY", "dummy-key")
-        self.model_name = openai_model
-        self.base_url = openai_base_url
         
+        # 优先使用参数传入的模型名称，如果没有则使用配置文件中的，都没有则使用默认值
+        self.model_name = openai_model or self.config.get("model_name", "default")
+        
+        # 确保base_url以/v1结尾
+        self.base_url = openai_base_url
+        if not self.base_url.endswith('/v1'):
+            self.base_url = f"{self.base_url}/v1"
+            
         # 初始化OpenAI兼容客户端（连接到本地Qwen模型）
         try:
             self.client = openai.OpenAI(
                 api_key=self.api_key,  # 使用任意值作为key
-                base_url=openai_base_url
+                base_url=self.base_url
             )
         except Exception as e:
             print(f"初始化LLM客户端错误: {e}")
@@ -84,7 +92,13 @@ class RAGService:
         # 加载向量数据库
         self._load_vector_db(vector_db_path)
         
+        # 检查向量数据库是否成功加载
+        if require_vector_db and self.index is None:
+            raise RuntimeError(f"向量数据库加载失败，无法提供RAG服务。请检查向量数据库路径: {vector_db_path}")
+        
         print(f"RAG服务初始化完成，使用模型: {self.model_name}, 模型端点: {self.base_url}, 向量库: {vector_db_path}")
+
+            
     
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """
@@ -126,6 +140,9 @@ class RAGService:
         Args:
             vector_db_path: 向量数据库路径
         """
+        # 先设置一个默认值，防止后续代码出错
+        self.index = None
+        
         try:
             if not os.path.exists(vector_db_path):
                 raise ValueError(f"向量数据库路径 {vector_db_path} 不存在")
@@ -141,7 +158,8 @@ class RAGService:
         except Exception as e:
             print(f"加载向量数据库错误: {e}")
             traceback.print_exc()
-            raise RuntimeError(f"加载向量数据库错误: {e}")
+            # 不立即抛出异常，而是在服务初始化时检查
+            print(f"警告: 向量数据库加载失败。RAG功能将不可用。")
     
     def _retrieve_context(
         self, 
@@ -160,6 +178,11 @@ class RAGService:
         Returns:
             Tuple[List[Dict], str]: 相关上下文列表和格式化后的上下文
         """
+        # 检查索引是否存在
+        if self.index is None:
+            print("警告: 向量数据库未加载，无法进行检索。")
+            return [], ""
+        
         # 获取检索器
         retriever = self.index.as_retriever(similarity_top_k=top_k)
         
@@ -357,17 +380,29 @@ class RAGService:
         messages = self._create_messages(query, formatted_context)
         
         # 调用API
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            temperature=actual_temperature,
-            max_tokens=actual_max_tokens,
-            stream=stream,
-            top_p=0.8,
-            extra_body={
-                "repetition_penalty": 1.05,
-            },
-        )
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=actual_temperature,
+                max_tokens=actual_max_tokens,
+                stream=stream,
+                top_p=0.8,
+                extra_body={
+                    "repetition_penalty": 1.05,
+                },
+            )
+        except Exception as e:
+            error_message = f"LLM API 错误: {str(e)}"
+            print(error_message)
+            traceback.print_exc()
+            
+            # 返回错误信息
+            return {
+                "completion": f"生成回复时发生错误: {str(e)}",
+                "error": str(e),
+                "contexts": contexts if return_context else None
+            }
         
         # 处理流式响应
         if stream:
@@ -417,17 +452,23 @@ class RAGService:
         max_tokens = self.config.get("max_tokens", 512)
         
         try:
-            # 检索相关上下文
-            contexts, formatted_context = self._retrieve_context(
-                query=query,
-                similarity_threshold=actual_threshold,
-                top_k=actual_top_k
-            )
+            # 检查索引是否存在
+            if self.index is None:
+                yield "错误: 向量数据库未加载，无法进行RAG检索。将仅使用用户查询生成回复。"
+                formatted_context = ""
+            else:
+                # 检索相关上下文
+                contexts, formatted_context = self._retrieve_context(
+                    query=query,
+                    similarity_threshold=actual_threshold,
+                    top_k=actual_top_k
+                )
             
             # 创建消息
             messages = self._create_messages(query, formatted_context)
             
             # 调用API（流式模式）
+            print(f"使用模型: {self.model_name} 进行流式生成")
             response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=messages,
@@ -441,23 +482,23 @@ class RAGService:
             )
             
             # 处理流式响应
-            collected_content = []
+            content_yielded = False
             
             for chunk in response:
                 if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
                     content = chunk.choices[0].delta.content
                     if content:
-                        collected_content.append(content)
+                        content_yielded = True
                         yield content
                 elif hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'text'):
                     # 处理不同的API响应格式
                     content = chunk.choices[0].text
                     if content:
-                        collected_content.append(content)
+                        content_yielded = True
                         yield content
                         
             # 如果没有内容返回，至少返回一个空字符串
-            if not collected_content:
+            if not content_yielded:
                 yield "未能生成回复。"
                 
         except Exception as e:
