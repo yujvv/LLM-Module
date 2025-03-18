@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from collections import defaultdict
 import os
 import json
 import yaml
@@ -15,6 +16,7 @@ from llama_index.core import (
 from llama_index.core.schema import NodeWithScore
 from llama_index.vector_stores.faiss import FaissVectorStore
 from embedding_service import CustomEmbeddingService
+from conversation_manager import ConversationManager
 
 
 class RAGService:
@@ -53,7 +55,7 @@ class RAGService:
         
         # 设置默认参数
         self.top_k = top_k
-        self.default_similarity_threshold = self.config.get("similarity_threshold", 0.7)
+        self.default_similarity_threshold = self.config.get("similarity_threshold", 2.0)
         
         # 设置LLM模型参数
         # 使用dummy key，因为我们连接的是本地Qwen模型，不需要真实的API密钥
@@ -96,6 +98,10 @@ class RAGService:
         if require_vector_db and self.index is None:
             raise RuntimeError(f"向量数据库加载失败，无法提供RAG服务。请检查向量数据库路径: {vector_db_path}")
         
+
+        # Initialize conversation manager
+        self.conversation_manager = ConversationManager()
+
         print(f"RAG服务初始化完成，使用模型: {self.model_name}, 模型端点: {self.base_url}, 向量库: {vector_db_path}")
 
             
@@ -242,13 +248,16 @@ class RAGService:
             
         return formatted_context
     
-    def _create_messages(self, query: str, context: str) -> List[Dict[str, str]]:
+    # def _create_messages(self, query: str, context: str) -> List[Dict[str, str]]:
+    def _create_messages(self, query: str, context: str, client_id: str = None, include_history: bool = True) -> List[Dict[str, str]]:
         """
-        创建消息列表
+        创建消息列表，包含历史记录
         
         Args:
             query: 用户查询
             context: 格式化后的上下文
+            client_id: 客户端ID，用于获取历史记录
+            include_history: 是否包含历史记录
             
         Returns:
             List[Dict[str, str]]: 消息列表
@@ -319,67 +328,129 @@ class RAGService:
         """
         
         system_prompt = self.config.get("system_prompt", role_play_prompt)
-        
-        
-        # 检测是否找到了有效上下文
+    
+        # Create base messages
         if not context:
-            # 使用无上下文模板
-            messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{query}\n\n"}
+            base_messages = [
+                {"role": "system", "content": system_prompt}
             ]
         else:
-            # 使用有上下文模板
-            messages = [
+            base_messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"{context}\n\nUser query:{query}\n\nPlease answer the above query based on the context provided."}
+                {"role": "user", "content": f"{context}\n\n以下是我的查询:\n{query}\n\n请根据提供的上下文回答问题。"}
             ]
         
-        return messages
-
+        # If we don't need history or don't have a client ID, return just the base messages
+        if not include_history or not client_id:
+            # For a fresh conversation without history, add the query as user message
+            if not context:
+                base_messages.append({"role": "user", "content": query})
+            return base_messages
+        
+        # Get conversation history
+        if hasattr(self.conversation_manager, 'get_formatted_history'):
+            history = self.conversation_manager.get_formatted_history(client_id)
+        else:
+            history = []
+        
+        # Combine base messages with history
+        # Start with system message
+        complete_messages = [base_messages[0]]
+        
+        # Add history messages
+        complete_messages.extend(history)
+        
+        # Add the current query as the last user message if not using context
+        # and it's not a duplicate of the last message
+        if not context:
+            # Check if we need to add the current query
+            should_add_query = True
+            
+            # Check if last message in history is from user with the same content
+            if history and history[-1]["role"] == "user" and history[-1]["content"] == query:
+                should_add_query = False
+                
+            if should_add_query:
+                complete_messages.append({"role": "user", "content": query})
+        
+        return complete_messages
     
+    
+    # Add this synchronous helper method to RAGService class:
+    def _get_history_sync(self, client_id: str, max_turns: int = 10) -> List[Dict[str, str]]:
+        """
+        同步获取对话历史 - 避免事件循环问题
+        """
+        # Directly access the history data structure
+        if not hasattr(self.conversation_manager, '_history') or client_id not in self.conversation_manager._history:
+            return []
+            
+        # Get history without using async
+        history = [msg for msg in self.conversation_manager._history[client_id] 
+                if msg["role"] != "system"]
+        
+        # Return at most the last max_turns messages
+        return history[-max_turns:] if len(history) > max_turns else history
+ 
+    # Modify create_completion method to store message history
+    # Also modify the create_completion method to avoid running coroutines directly:
     def create_completion(
         self,
         query: str,
+        client_id: Optional[str] = None,
         similarity_threshold: Optional[float] = None,
         top_k: Optional[int] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         stream: bool = False,
-        return_context: bool = False
+        return_context: bool = False,
+        include_history: bool = True
     ) -> Dict[str, Any]:
         """
         创建RAG增强的完成
         
         Args:
             query: 用户查询
+            client_id: 客户端ID，用于存储和获取历史记录
             similarity_threshold: 相似度阈值（可选，默认使用配置值）
             top_k: 检索结果数量（可选，默认使用初始化值）
             temperature: 温度参数（可选，默认使用配置值）
             max_tokens: 最大生成token数（可选，默认使用配置值）
             stream: 是否流式返回
             return_context: 是否返回检索的上下文
+            include_history: 是否包含历史记录
             
         Returns:
             Dict[str, Any]: 回复结果
         """
-        # 使用提供的参数或默认值
+        # Use provided parameters or defaults
         actual_threshold = similarity_threshold if similarity_threshold is not None else self.default_similarity_threshold
         actual_top_k = top_k if top_k is not None else self.top_k
         actual_temperature = temperature if temperature is not None else self.config.get("temperature", 0.7)
         actual_max_tokens = max_tokens if max_tokens is not None else self.config.get("max_tokens", 512)
         
-        # 检索相关上下文
-        contexts, formatted_context = self._retrieve_context(
-            query=query,
-            similarity_threshold=actual_threshold,
-            top_k=actual_top_k
-        )
+        # If we have a client ID, store the query in history
+        # NOTE: We no longer need to add the user message here since it will be added
+        # in the _create_messages method to prevent duplication
         
-        # 创建消息
-        messages = self._create_messages(query, formatted_context)
+        # Skip RAG for empty queries
+        if not query or query.strip() == "":
+            # Create messages without context
+            messages = self._create_messages("", "", client_id, include_history)
+            formatted_context = ""
+            contexts = []
+        else:
+            # Retrieve relevant context for non-empty queries
+            contexts, formatted_context = self._retrieve_context(
+                query=query,
+                similarity_threshold=actual_threshold,
+                top_k=actual_top_k
+            )
+            
+            # Create messages with context and history if available
+            messages = self._create_messages(query, formatted_context, client_id, include_history)
         
-        # 调用API
+        # Call the API
         try:
             response = self.client.chat.completions.create(
                 model=self.model_name,
@@ -395,22 +466,35 @@ class RAGService:
         except Exception as e:
             error_message = f"LLM API 错误: {str(e)}"
             print(error_message)
+            import traceback
             traceback.print_exc()
             
-            # 返回错误信息
+            # Return error information
             return {
                 "completion": f"生成回复时发生错误: {str(e)}",
                 "error": str(e),
                 "contexts": contexts if return_context else None
             }
         
-        # 处理流式响应
+        # Handle streaming response
         if stream:
             return {"stream": response, "contexts": contexts if return_context else None}
         
-        # 构建返回结果
+        # Get the completion text
+        completion_text = response.choices[0].message.content
+        
+        # Store the response in conversation history if we have a client ID
+        if client_id:
+            # First, add the user's query if it wasn't added before
+            if not self._message_exists(client_id, "user", query):
+                self.conversation_manager.add_message(client_id, "user", query)
+                
+            # Then add the assistant's response
+            self.conversation_manager.add_message(client_id, "assistant", completion_text)
+        
+        # Build result
         result = {
-            "completion": response.choices[0].message.content,
+            "completion": completion_text,
             "model": response.model,
             "usage": {
                 "prompt_tokens": response.usage.prompt_tokens,
@@ -419,55 +503,65 @@ class RAGService:
             }
         }
         
-        # 如果需要返回上下文信息
+        # Include context information if requested
         if return_context:
             result["contexts"] = contexts
             result["formatted_context"] = formatted_context
         
         return result
     
+    # Modify create_completion_stream to store streamed responses in history
     async def create_completion_stream(
         self,
         query: str,
         client_id: str,
         similarity_threshold: Optional[float] = None,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        include_history: bool = True
     ) -> AsyncGenerator[str, None]:
         """
-        创建流式响应的异步生成器
+        创建流式响应的异步生成器，并记录历史
         
         Args:
             query: 用户查询
             client_id: 客户端ID
             similarity_threshold: 相似度阈值（可选）
             top_k: 检索结果数量（可选）
+            include_history: 是否包含历史记录
             
         Yields:
             str: 流式响应的文本块
         """
-        # 使用提供的参数或默认值
+        # Store the user query in history
+        await self.conversation_manager.add_message(client_id, "user", query)
+        
+        # Use provided parameters or defaults
         actual_threshold = similarity_threshold if similarity_threshold is not None else self.default_similarity_threshold
         actual_top_k = top_k if top_k is not None else self.top_k
         temperature = self.config.get("temperature", 0.7)
         max_tokens = self.config.get("max_tokens", 512)
         
         try:
-            # 检查索引是否存在
-            if self.index is None:
-                yield "错误: 向量数据库未加载，无法进行RAG检索。将仅使用用户查询生成回复。"
+            # Skip RAG for empty queries
+            if not query or query.strip() == "":
                 formatted_context = ""
             else:
-                # 检索相关上下文
-                contexts, formatted_context = self._retrieve_context(
-                    query=query,
-                    similarity_threshold=actual_threshold,
-                    top_k=actual_top_k
-                )
+                # Check if index exists
+                if self.index is None:
+                    yield "错误: 向量数据库未加载，无法进行RAG检索。将仅使用用户查询生成回复。"
+                    formatted_context = ""
+                else:
+                    # Retrieve relevant context
+                    contexts, formatted_context = self._retrieve_context(
+                        query=query,
+                        similarity_threshold=actual_threshold,
+                        top_k=actual_top_k
+                    )
             
-            # 创建消息
-            messages = self._create_messages(query, formatted_context)
+            # Create messages with context and history
+            messages = self._create_messages(query, formatted_context, client_id, include_history)
             
-            # 调用API（流式模式）
+            # Call API (stream mode)
             print(f"使用模型: {self.model_name} 进行流式生成")
             response = self.client.chat.completions.create(
                 model=self.model_name,
@@ -481,32 +575,77 @@ class RAGService:
                 },
             )
             
-            # 处理流式响应
+            # Process streaming response and accumulate in history
             content_yielded = False
+            accumulated_text = ""
             
             for chunk in response:
+                content = None
                 if hasattr(chunk.choices[0], 'delta') and hasattr(chunk.choices[0].delta, 'content'):
                     content = chunk.choices[0].delta.content
-                    if content:
-                        content_yielded = True
-                        yield content
                 elif hasattr(chunk, 'choices') and chunk.choices and hasattr(chunk.choices[0], 'text'):
-                    # 处理不同的API响应格式
                     content = chunk.choices[0].text
-                    if content:
-                        content_yielded = True
-                        yield content
-                        
-            # 如果没有内容返回，至少返回一个空字符串
+                    
+                if content:
+                    content_yielded = True
+                    accumulated_text += content
+                    
+                    # Store partial response in history
+                    await self.conversation_manager.add_partial_response(client_id, content)
+                    
+                    # Yield to client
+                    yield content
+                    
+            # If no content was yielded, provide a fallback message
             if not content_yielded:
-                yield "未能生成回复。"
-                
+                fallback_message = "未能生成回复。"
+                await self.conversation_manager.add_message(client_id, "assistant", fallback_message)
+                yield fallback_message
+                    
         except Exception as e:
             error_message = f"流式响应错误: {str(e)}"
             print(error_message)
             traceback.print_exc()
+            
+            # Add error message to history
+            await self.conversation_manager.add_message(client_id, "assistant", error_message)
+            
             yield error_message
+            
+    # Add these synchronous helper methods to RAGService class:
+    def _add_message_sync(self, client_id: str, role: str, content: str) -> None:
+        """同步添加消息到历史记录"""
+        if not hasattr(self.conversation_manager, '_history'):
+            self.conversation_manager._history = defaultdict(list)
+        self.conversation_manager._history[client_id].append({"role": role, "content": content})
 
+    def _add_partial_response_sync(self, client_id: str, content: str) -> None:
+        """同步添加部分响应到历史记录"""
+        if not hasattr(self.conversation_manager, '_history'):
+            self.conversation_manager._history = defaultdict(list)
+            
+        if self.conversation_manager._history[client_id] and self.conversation_manager._history[client_id][-1]["role"] == "assistant":
+            self.conversation_manager._history[client_id][-1]["content"] += content
+        else:
+            self.conversation_manager._history[client_id].append({"role": "assistant", "content": content})
+
+    # Add this helper method to check if a message already exists in history
+    def _message_exists(self, client_id: str, role: str, content: str) -> bool:
+        """
+        检查消息是否已存在于历史记录中
+        """
+        if not hasattr(self.conversation_manager, '_history'):
+            return False
+            
+        if client_id not in self.conversation_manager._history:
+            return False
+            
+        # Check if this exact message already exists
+        for msg in self.conversation_manager._history[client_id]:
+            if msg["role"] == role and msg["content"] == content:
+                return True
+                
+        return False
 
 '''
 if __name__ == "__main__":
